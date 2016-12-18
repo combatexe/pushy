@@ -21,6 +21,8 @@
 package com.relayrides.pushy.apns;
 
 import java.nio.charset.StandardCharsets;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
 import java.security.SignatureException;
 import java.util.Date;
 import java.util.HashMap;
@@ -28,6 +30,7 @@ import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
@@ -67,9 +70,10 @@ class ApnsClientHandler extends Http2ConnectionHandler {
     private final Map<Integer, String> authenticationTokensByStreamId = new HashMap<>();
     private final Map<Integer, Http2Headers> headersByStreamId = new HashMap<>();
 
+    private final Map<String, AuthenticationTokenSupplier> authenticationTokenSuppliersByTopic = new HashMap<>();
+
     private final Map<ApnsPushNotification, Promise<PushNotificationResponse<ApnsPushNotification>>> responsePromises = new IdentityHashMap<>();
 
-    private final ApnsClient apnsClient;
     private final String authority;
 
     private long nextPingId = new Random().nextLong();
@@ -98,17 +102,8 @@ class ApnsClientHandler extends Http2ConnectionHandler {
 
     public static class ApnsClientHandlerBuilder extends AbstractHttp2ConnectionHandlerBuilder<ApnsClientHandler, ApnsClientHandlerBuilder> {
 
-        private ApnsClient apnsClient;
         private String authority;
-
-        public ApnsClientHandlerBuilder apnsClient(final ApnsClient apnsClient) {
-            this.apnsClient = apnsClient;
-            return this;
-        }
-
-        public ApnsClient apnsClient() {
-            return this.apnsClient;
-        }
+        private SigningKeyRegistrationEvent initialSigningKeyRegistrationEvent;
 
         public ApnsClientHandlerBuilder authority(final String authority) {
             this.authority = authority;
@@ -118,6 +113,16 @@ class ApnsClientHandler extends Http2ConnectionHandler {
         public String authority() {
             return this.authority;
         }
+
+        public ApnsClientHandlerBuilder initialSigningKeyRegistrationEvent(final SigningKeyRegistrationEvent event) {
+            this.initialSigningKeyRegistrationEvent = event;
+            return this;
+        }
+
+        public SigningKeyRegistrationEvent initialSigningKeyRegistrationEvent() {
+            return this.initialSigningKeyRegistrationEvent;
+        }
+
         @Override
         public ApnsClientHandlerBuilder server(final boolean isServer) {
             return super.server(isServer);
@@ -132,7 +137,7 @@ class ApnsClientHandler extends Http2ConnectionHandler {
         public ApnsClientHandler build(final Http2ConnectionDecoder decoder, final Http2ConnectionEncoder encoder, final Http2Settings initialSettings) {
             Objects.requireNonNull(this.authority(), "Authority must be set before building an ApnsClientHandler.");
 
-            final ApnsClientHandler handler = new ApnsClientHandler(decoder, encoder, initialSettings, this.apnsClient(), this.authority());
+            final ApnsClientHandler handler = new ApnsClientHandler(decoder, encoder, initialSettings, this.authority(), this.initialSigningKeyRegistrationEvent);
             this.frameListener(handler.new ApnsClientHandlerFrameAdapter());
             return handler;
         }
@@ -169,9 +174,12 @@ class ApnsClientHandler extends Http2ConnectionHandler {
                     final ErrorResponse errorResponse = gson.fromJson(responseBody, ErrorResponse.class);
 
                     if (ApnsClientHandler.EXPIRED_AUTH_TOKEN_REASON.equals(errorResponse.getReason())) {
-                        try {
-                            ApnsClientHandler.this.apnsClient.getAuthenticationTokenSupplierForTopic(pushNotification.getTopic()).invalidateToken(authenticationToken);
-                        } catch (final NoKeyForTopicException e) {
+                        final AuthenticationTokenSupplier authenticationTokenSupplier =
+                                ApnsClientHandler.this.authenticationTokenSuppliersByTopic.get(pushNotification.getTopic());
+
+                        if (authenticationTokenSupplier != null) {
+                            authenticationTokenSupplier.invalidateToken(authenticationToken);
+                        } else {
                             // This should only happen if somebody de-registered the topic after a notification was sent
                             log.warn("Authentication token expired, but no key registered for topic {}", pushNotification.getTopic());
                         }
@@ -235,11 +243,11 @@ class ApnsClientHandler extends Http2ConnectionHandler {
         }
     }
 
-    protected ApnsClientHandler(final Http2ConnectionDecoder decoder, final Http2ConnectionEncoder encoder, final Http2Settings initialSettings, final ApnsClient apnsClient, final String authority) {
+    protected ApnsClientHandler(final Http2ConnectionDecoder decoder, final Http2ConnectionEncoder encoder, final Http2Settings initialSettings, final String authority, final SigningKeyRegistrationEvent initialSigningKeyRegistrationEvent) {
         super(decoder, encoder, initialSettings);
 
-        this.apnsClient = apnsClient;
         this.authority = authority;
+        this.handleSigningKeyRegistrationEvent(initialSigningKeyRegistrationEvent);
     }
 
     void setResponsePromiseForNotification(final ApnsPushNotification pushNotification, final Promise<PushNotificationResponse<ApnsPushNotification>> responsePromise) {
@@ -282,7 +290,17 @@ class ApnsClientHandler extends Http2ConnectionHandler {
                         .path(APNS_PATH_PREFIX + pushNotification.getToken())
                         .addInt(APNS_EXPIRATION_HEADER, pushNotification.getExpiration() == null ? 0 : (int) (pushNotification.getExpiration().getTime() / 1000));
 
-                final String authenticationToken = this.apnsClient.getAuthenticationTokenSupplierForTopic(pushNotification.getTopic()).getToken();
+                final String authenticationToken;
+                {
+                    final AuthenticationTokenSupplier authenticationTokenSupplier = this.authenticationTokenSuppliersByTopic.get(pushNotification.getTopic());
+
+                    if (authenticationTokenSupplier == null) {
+                        throw new NoKeyForTopicException("No signing key found for topic: " + pushNotification.getTopic());
+                    }
+
+                    authenticationToken = authenticationTokenSupplier.getToken();
+                }
+
                 headers.add(APNS_AUTHORIZATION_HEADER, "bearer " + authenticationToken);
 
                 if (pushNotification.getCollapseId() != null) {
@@ -376,6 +394,8 @@ class ApnsClientHandler extends Http2ConnectionHandler {
             });
 
             this.flush(context);
+        } else if (event instanceof SigningKeyRegistrationEvent) {
+            this.handleSigningKeyRegistrationEvent((SigningKeyRegistrationEvent) event);
         }
 
         super.userEventTriggered(context, event);
@@ -427,5 +447,27 @@ class ApnsClientHandler extends Http2ConnectionHandler {
         // This will always be called from inside the channel's event loop, so we don't have to worry about
         // synchronization.
         this.responsePromises.remove(pushNotification).tryFailure(new ApnsServerException(message));
+    }
+
+    private void handleSigningKeyRegistrationEvent(final SigningKeyRegistrationEvent event) {
+        if (event.getTopicsToClear() != null) {
+            for (final String topic : event.getTopicsToClear()) {
+                this.authenticationTokenSuppliersByTopic.remove(topic);
+            }
+        }
+
+        if (event.getKeysToAdd() != null) {
+            for (final Map.Entry<AuthenticationTokenSupplier, Set<String>> entry : event.getKeysToAdd().entrySet()) {
+                for (final String topic : entry.getValue()) {
+                    try {
+                        this.authenticationTokenSuppliersByTopic.put(topic, new AuthenticationTokenSupplier(entry.getKey()));
+                    } catch (InvalidKeyException | NoSuchAlgorithmException e) {
+                        // This should never happen; if we already have one token supplier, we've established that the
+                        // algorithm and key are both good.
+                        throw new RuntimeException("Key or algorithm from existing token supplier is invalid.", e);
+                    }
+                }
+            }
+        }
     }
 }
